@@ -1,0 +1,24 @@
+{
+  "contador": 1,
+  "ultima": {
+    "1394508466172858468": 1789960849544
+  },
+  "quejas": {
+    "1": {
+      "userId": "1394508466172858468",
+      "asunto": "hay algo aqui q no me gusta",
+      "sobre": "frailin es gay",
+      "detalle": "frailin y johan son gay",
+      "pruebas": "",
+      "anonima": false,
+      "estado": "resuelta",
+      "fecha": "2026-09-21T03:20:49.544Z",
+      "canalId": "1551430967577673748",
+      "mensajeId": "1551432990607802419",
+      "atendidaPor": "1394508466172858468",
+      "respuesta": "okey resolveremos eso",
+      "cerradaPor": "1394508466172858468",
+      "cierre": "2026-09-21T03:21:19.706Z"
+    }
+  }
+}
