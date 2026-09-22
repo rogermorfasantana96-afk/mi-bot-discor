@@ -77,6 +77,16 @@ const COOLDOWN_QUEJAS_MS = 10 * 60 * 1000; // 10 minutos
 
 // Duración de la suspensión (timeout) para la 1ª y 2ª falta
 const SUSPENSION_MS = 60 * 60 * 1000; // 1 hora
+
+// ----- Canales de solo imágenes/video -----
+// En estos canales NO se permite texto (letras, números, etc.) sin un archivo adjunto.
+// Si el mensaje trae una imagen o video adjunto, sí se le permite escribir texto junto a él.
+// Si el mensaje no trae ningún adjunto, se borra automáticamente sin importar lo que diga.
+const CANALES_SOLO_IMAGENES = [
+  "1544437328079097946",
+  "1544437727918034944",
+  "1544435577678463166",
+];
 // =====================================================
 
 const DATA_FILE = path.join(__dirname, "verificaciones.json");
@@ -450,6 +460,16 @@ async function enviarDM(usuario, embed, archivos = []) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
+
+  // ---------- Canales de solo imágenes/video ----------
+  // No se permite texto (letras/números) sin un adjunto. Si trae imagen o video, se
+  // le permite escribir también. Si no trae nada de adjunto, se borra directamente.
+  if (CANALES_SOLO_IMAGENES.includes(message.channel.id)) {
+    if (message.attachments.size === 0) {
+      await message.delete().catch(() => {});
+      return;
+    }
+  }
 
   const palabra = detectarMalaPalabra(message.content);
   if (!palabra) return;
