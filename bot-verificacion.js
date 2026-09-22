@@ -39,10 +39,10 @@ const ROL_VERIFICADO_ID = "1551092417027907676";
 const CANAL_LOGS_ID = "1551100223068307528";
 
 // Canal donde el bot publica la tarjeta de perfil de cada jugador registrado.
-const CANAL_REGISTROS_ID = "1544439465206882344";
+const CANAL_REGISTROS_ID = "1551802968746106911";
 
 // Canal donde se publica el panel (embed + botones) del registro de jugadores.
-const CANAL_PANEL_REGISTRO_ID = "1551802968746106911";
+const CANAL_PANEL_REGISTRO_ID = "1544439465206882344";
 
 // Rol que se le da al registrarse (opcional). Déjalo vacío "" si no quieres rol.
 const ROL_REGISTRADO_ID = "";
