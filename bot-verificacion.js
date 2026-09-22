@@ -87,7 +87,35 @@ const CANALES_SOLO_IMAGENES = [
   "1544437727918034944",
   "1544435577678463166",
 ];
+
+// ----- Antiflood (spam de mensajes) -----
+// Si un usuario manda más de FLOOD_MAX_MENSAJES mensajes en FLOOD_INTERVALO_MS, se
+// considera flood: se borran sus mensajes recientes y se le aplica una suspensión.
+const FLOOD_MAX_MENSAJES = 5;
+const FLOOD_INTERVALO_MS = 6 * 1000; // 6 segundos
+const FLOOD_SUSPENSION_MS = 6 * 60 * 1000; // 6 minutos
+// Tiempo que debe pasar para que un usuario ya suspendido por flood pueda volver a
+// activar la alerta (evita re-suspenderlo en cadena mientras cae el timeout).
+const FLOOD_COOLDOWN_ALERTA_MS = FLOOD_SUSPENSION_MS;
+
+// ----- Antiraid (entradas masivas de miembros) -----
+// Si entran RAID_MAX_INGRESOS miembros nuevos en RAID_INTERVALO_MS, se activa el
+// "modo raid": mientras está activo, cualquier miembro que entre se expulsa (o banea)
+// automáticamente y se avisa al staff. Se puede activar/desactivar a mano con /antiraid.
+const RAID_MAX_INGRESOS = 6;
+const RAID_INTERVALO_MS = 12 * 1000; // 12 segundos
+const RAID_DURACION_MS = 10 * 60 * 1000; // el modo raid dura 10 minutos si no se apaga a mano
+// Qué hacer con los que entran mientras el modo raid está activo: "kick" o "ban"
+const RAID_ACCION = "kick";
+// Canal donde se avisa cuando se activa/desactiva el modo raid (usa el de logs por defecto)
+const CANAL_ALERTAS_RAID_ID = CANAL_LOGS_ID;
+
+// ----- Estado del bot (panel prendido/apagado) -----
+// Canal donde el bot publica/actualiza un embed que dice si está prendido o apagado.
+const CANAL_ESTADO_BOT_ID = "1551815869594607736";
 // =====================================================
+
+const ESTADO_BOT_FILE = path.join(__dirname, "estado-bot.json");
 
 const DATA_FILE = path.join(__dirname, "verificaciones.json");
 const OFENSAS_FILE = path.join(__dirname, "ofensas.json");
@@ -150,6 +178,49 @@ function guardarQuejas(data) {
   fs.writeFileSync(QUEJAS_FILE, JSON.stringify(data, null, 2));
 }
 
+function cargarEstadoBot() {
+  if (!fs.existsSync(ESTADO_BOT_FILE)) {
+    fs.writeFileSync(ESTADO_BOT_FILE, JSON.stringify({ mensajeId: null }, null, 2));
+  }
+  return JSON.parse(fs.readFileSync(ESTADO_BOT_FILE, "utf8"));
+}
+
+function guardarEstadoBot(data) {
+  fs.writeFileSync(ESTADO_BOT_FILE, JSON.stringify(data, null, 2));
+}
+
+// Publica o edita el panel del canal de estado ("🟢 Prendido" / "🔴 Apagado")
+async function actualizarPanelEstadoBot(prendido) {
+  if (!CANAL_ESTADO_BOT_ID) return;
+  const canal = await client.channels.fetch(CANAL_ESTADO_BOT_ID).catch(() => null);
+  if (!canal || !canal.isTextBased()) return;
+
+  const embed = crearEmbed({
+    titulo: prendido ? "🟢 Bot prendido" : "🔴 Bot apagado",
+    color: prendido ? COLORES.verde : COLORES.rojo,
+    descripcion: prendido
+      ? "El bot está en línea y funcionando."
+      : "El bot está apagado en este momento.",
+    pie: "Última actualización",
+  });
+
+  const datos = cargarEstadoBot();
+
+  if (datos.mensajeId) {
+    const existente = await canal.messages.fetch(datos.mensajeId).catch(() => null);
+    if (existente) {
+      await existente.edit({ embeds: [embed] }).catch(() => {});
+      return;
+    }
+  }
+
+  const nuevo = await canal.send({ embeds: [embed] }).catch(() => null);
+  if (nuevo) {
+    datos.mensajeId = nuevo.id;
+    guardarEstadoBot(datos);
+  }
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -202,7 +273,193 @@ async function enviarLog(embed, archivos = []) {
   }
 }
 
-client.on("guildMemberAdd", (member) => {
+async function enviarAlertaRaid(embed) {
+  if (!CANAL_ALERTAS_RAID_ID) return;
+  const canal = await client.channels.fetch(CANAL_ALERTAS_RAID_ID).catch(() => null);
+  if (canal) {
+    const menciones = ROLES_STAFF_IDS.map((id) => `<@&${id}>`).join(" ");
+    canal.send({ content: menciones || undefined, embeds: [embed] }).catch(() => {});
+  }
+}
+
+// ================== ANTIFLOOD ==================
+// Map<userId, { timestamps: number[], ultimaAlerta: number }>
+const floodRegistro = new Map();
+
+// Devuelve true si el mensaje disparó la alerta de flood (y ya se encargó de todo)
+async function revisarFlood(message) {
+  const ahora = Date.now();
+  const entrada = floodRegistro.get(message.author.id) ?? { timestamps: [], ultimaAlerta: 0 };
+
+  entrada.timestamps = entrada.timestamps.filter((t) => ahora - t < FLOOD_INTERVALO_MS);
+  entrada.timestamps.push(ahora);
+  floodRegistro.set(message.author.id, entrada);
+
+  if (entrada.timestamps.length < FLOOD_MAX_MENSAJES) return false;
+
+  // Ya fue avisado hace poco (probablemente sigue suspendido): solo se borra el mensaje
+  if (ahora - entrada.ultimaAlerta < FLOOD_COOLDOWN_ALERTA_MS) {
+    await message.delete().catch(() => {});
+    return true;
+  }
+  entrada.ultimaAlerta = ahora;
+  entrada.timestamps = [];
+  floodRegistro.set(message.author.id, entrada);
+
+  await message.delete().catch(() => {});
+
+  const member =
+    message.member ?? (await message.guild.members.fetch(message.author.id).catch(() => null));
+
+  let suspendido = false;
+  if (member) {
+    const esAdmin =
+      member.id === message.guild.ownerId ||
+      member.permissions.has(PermissionFlagsBits.Administrator);
+    if (!esAdmin) {
+      suspendido = await member
+        .timeout(FLOOD_SUSPENSION_MS, "Flood de mensajes (antiflood)")
+        .then(() => true)
+        .catch(() => false);
+
+      await enviarDM(
+        message.author,
+        crearEmbed({
+          titulo: "⚠️ Flood detectado",
+          color: COLORES.naranja,
+          descripcion:
+            `Enviaste demasiados mensajes muy rápido en **${message.guild.name}**.\n\n` +
+            `Fuiste suspendido por **${Math.round(FLOOD_SUSPENSION_MS / 60000)} minutos**.\n\n` +
+            `Por favor no hagas flood/spam de mensajes, la próxima vez la suspensión puede ser mayor.`,
+        })
+      );
+    }
+  }
+
+  enviarLog(
+    crearEmbed({
+      titulo: "🌊 Flood detectado",
+      color: COLORES.naranja,
+      miniatura: message.author.displayAvatarURL({ size: 256 }),
+      campos: [
+        { name: "Usuario", value: `<@${message.author.id}> (${message.author.tag})`, inline: false },
+        { name: "Canal", value: `<#${message.channel.id}>`, inline: true },
+        { name: "Suspendido", value: suspendido ? "✅ Sí" : "❌ No (es admin o falló)", inline: true },
+      ],
+    })
+  );
+
+  return true;
+}
+
+// ================== ANTIRAID ==================
+let ingresosRecientes = []; // timestamps (ms) de los últimos guildMemberAdd
+let modoRaidActivo = false;
+let modoRaidHasta = 0;
+let modoRaidTimer = null;
+
+function estadoRaidTexto() {
+  if (!modoRaidActivo) return "🟢 Inactivo";
+  const restanteMin = Math.max(0, Math.ceil((modoRaidHasta - Date.now()) / 60000));
+  return `🔴 Activo (quedan ~${restanteMin} min)`;
+}
+
+async function activarModoRaid(guild, motivo) {
+  const yaEstabaActivo = modoRaidActivo;
+  modoRaidActivo = true;
+  modoRaidHasta = Date.now() + RAID_DURACION_MS;
+
+  if (modoRaidTimer) clearTimeout(modoRaidTimer);
+  modoRaidTimer = setTimeout(() => desactivarModoRaid(guild, "Tiempo cumplido"), RAID_DURACION_MS);
+
+  if (!yaEstabaActivo) {
+    await enviarAlertaRaid(
+      crearEmbed({
+        titulo: "🚨 MODO RAID ACTIVADO",
+        color: COLORES.rojo,
+        descripcion:
+          `${motivo}\n\n` +
+          `Mientras el modo raid esté activo, los miembros que entren serán ` +
+          `**${RAID_ACCION === "ban" ? "baneados" : "expulsados"}** automáticamente.\n` +
+          `Usa \`/antiraid desactivar\` para apagarlo antes si fue una falsa alarma.`,
+        pie: `Se apaga solo en ${Math.round(RAID_DURACION_MS / 60000)} minutos`,
+      })
+    );
+  }
+}
+
+async function desactivarModoRaid(guild, motivo) {
+  if (!modoRaidActivo) return;
+  modoRaidActivo = false;
+  modoRaidHasta = 0;
+  if (modoRaidTimer) {
+    clearTimeout(modoRaidTimer);
+    modoRaidTimer = null;
+  }
+  ingresosRecientes = [];
+
+  await enviarAlertaRaid(
+    crearEmbed({
+      titulo: "✅ Modo raid desactivado",
+      color: COLORES.verde,
+      descripcion: motivo ?? "El modo raid fue desactivado.",
+    })
+  );
+}
+
+// Se llama en cada guildMemberAdd: detecta oleadas de entradas y actúa si el modo raid está activo
+async function revisarRaid(member) {
+  const ahora = Date.now();
+  ingresosRecientes = ingresosRecientes.filter((t) => ahora - t < RAID_INTERVALO_MS);
+  ingresosRecientes.push(ahora);
+
+  if (!modoRaidActivo && ingresosRecientes.length >= RAID_MAX_INGRESOS) {
+    await activarModoRaid(
+      member.guild,
+      `Se detectaron **${ingresosRecientes.length} entradas** en menos de ${Math.round(
+        RAID_INTERVALO_MS / 1000
+      )} segundos.`
+    );
+  }
+
+  if (modoRaidActivo) {
+    const accion =
+      RAID_ACCION === "ban"
+        ? member.ban({ reason: "Modo raid activo" }).then(() => "baneado")
+        : member.kick("Modo raid activo").then(() => "expulsado");
+
+    const resultado = await accion.catch(() => null);
+
+    enviarAlertaRaid(
+      crearEmbed({
+        titulo: resultado ? "🚫 Miembro expulsado por modo raid" : "⚠️ No se pudo actuar (modo raid)",
+        color: resultado ? COLORES.rojo : COLORES.amarillo,
+        miniatura: member.user.displayAvatarURL({ size: 256 }),
+        campos: [
+          { name: "Usuario", value: `${member.user.tag} (\`${member.id}\`)`, inline: false },
+          {
+            name: "Cuenta creada",
+            value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`,
+            inline: true,
+          },
+          {
+            name: "Resultado",
+            value: resultado ? `✅ ${resultado}` : "❌ No se pudo (revisa mis permisos)",
+            inline: true,
+          },
+        ],
+      })
+    );
+    return true;
+  }
+
+  return false;
+}
+
+client.on("guildMemberAdd", async (member) => {
+  const expulsadoPorRaid = await revisarRaid(member).catch(() => false);
+  if (expulsadoPorRaid) return; // ya se registró en la alerta de raid, no hace falta duplicar el log
+
   enviarLog(
     crearEmbed({
       titulo: "📥 Entró al servidor",
@@ -460,6 +717,10 @@ async function enviarDM(usuario, embed, archivos = []) {
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
+
+  // ---------- Antiflood ----------
+  const esFlood = await revisarFlood(message).catch(() => false);
+  if (esFlood) return;
 
   // ---------- Canales de solo imágenes/video ----------
   // No se permite texto (letras/números) sin un adjunto. Si trae imagen o video, se
@@ -1030,6 +1291,14 @@ const comandos = [
       o.setName("texto").setDescription("Usuario o nombre a buscar").setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName("antiraid")
+    .setDescription("Controla el modo antiraid del servidor")
+    .addSubcommand((s) => s.setName("estado").setDescription("Muestra si el modo raid está activo"))
+    .addSubcommand((s) => s.setName("activar").setDescription("Activa el modo raid manualmente"))
+    .addSubcommand((s) => s.setName("desactivar").setDescription("Desactiva el modo raid"))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ].map((c) => c.toJSON());
 
 async function registrarComandos() {
@@ -1043,7 +1312,24 @@ async function registrarComandos() {
 client.once("ready", async () => {
   console.log(`Bot conectado como ${client.user.tag}`);
   await registrarComandos();
+  await actualizarPanelEstadoBot(true);
 });
+
+// Cuando Railway (u otro hosting) detiene o reinicia el proceso, manda una de estas
+// señales antes de matarlo. Las aprovechamos para dejar el panel en "Apagado".
+async function apagarConGracia(señal) {
+  console.log(`Recibida ${señal}, actualizando panel a apagado...`);
+  try {
+    await actualizarPanelEstadoBot(false);
+  } catch (e) {
+    console.error("No se pudo actualizar el panel de estado antes de apagar:", e);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGINT", () => apagarConGracia("SIGINT"));
+process.on("SIGTERM", () => apagarConGracia("SIGTERM"));
 
 // ================== INTERACCIONES ==================
 client.on("interactionCreate", async (interaction) => {
@@ -2888,6 +3174,68 @@ client.on("interactionCreate", async (interaction) => {
           ],
         })
       );
+      return;
+    }
+    // =====================================================
+    //                    ANTIRAID
+    // =====================================================
+    if (interaction.isChatInputCommand() && interaction.commandName === "antiraid") {
+      if (!interaction.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+        await interaction.reply({
+          embeds: [embedRespuesta("error", "Solo los administradores pueden usar este comando.")],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const sub = interaction.options.getSubcommand();
+
+      if (sub === "estado") {
+        await interaction.reply({
+          embeds: [
+            crearEmbed({
+              titulo: "🛡️ Estado del antiraid",
+              color: modoRaidActivo ? COLORES.rojo : COLORES.verde,
+              campos: [
+                { name: "Modo raid", value: estadoRaidTexto(), inline: true },
+                { name: "Acción configurada", value: RAID_ACCION === "ban" ? "Banear" : "Expulsar", inline: true },
+                {
+                  name: "Umbral de detección",
+                  value: `${RAID_MAX_INGRESOS} entradas en ${Math.round(RAID_INTERVALO_MS / 1000)}s`,
+                  inline: false,
+                },
+              ],
+            }),
+          ],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (sub === "activar") {
+        await activarModoRaid(interaction.guild, `Activado manualmente por <@${interaction.user.id}>.`);
+        await interaction.reply({
+          embeds: [embedRespuesta("exito", "Modo raid activado manualmente.")],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      if (sub === "desactivar") {
+        if (!modoRaidActivo) {
+          await interaction.reply({
+            embeds: [embedRespuesta("info", "El modo raid ya estaba desactivado.")],
+            ephemeral: true,
+          });
+          return;
+        }
+        await desactivarModoRaid(interaction.guild, `Desactivado manualmente por <@${interaction.user.id}>.`);
+        await interaction.reply({
+          embeds: [embedRespuesta("exito", "Modo raid desactivado.")],
+          ephemeral: true,
+        });
+        return;
+      }
       return;
     }
   } catch (error) {
