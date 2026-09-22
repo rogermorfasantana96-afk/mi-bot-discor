@@ -41,6 +41,9 @@ const CANAL_LOGS_ID = "1551100223068307528";
 // Canal donde el bot publica la tarjeta de perfil de cada jugador registrado.
 const CANAL_REGISTROS_ID = "1544439465206882344";
 
+// Canal donde se publica el panel (embed + botones) del registro de jugadores.
+const CANAL_PANEL_REGISTRO_ID = "1551802968746106911";
+
 // Rol que se le da al registrarse (opcional). Déjalo vacío "" si no quieres rol.
 const ROL_REGISTRADO_ID = "";
 
@@ -1336,6 +1339,15 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      const canal = await client.channels.fetch(CANAL_PANEL_REGISTRO_ID).catch(() => null);
+      if (!canal || !canal.isTextBased()) {
+        await interaction.reply({
+          embeds: [embedRespuesta("error", "No encuentro el canal del panel de registro. Revisa `CANAL_PANEL_REGISTRO_ID`.")],
+          ephemeral: true,
+        });
+        return;
+      }
+
       const total = Object.keys(cargarRegistros()).length;
 
       const embed = new EmbedBuilder()
@@ -1374,7 +1386,7 @@ client.on("interactionCreate", async (interaction) => {
         )
         .setColor(COLORES.azul)
         .setThumbnail(interaction.guild.iconURL({ size: 256 }) ?? null)
-        .setFooter({ text: `Jugadores registrados: ${total}` })
+        .setFooter({ text: `${interaction.guild.name} • Jugadores registrados: ${total}` })
         .setTimestamp();
 
       const botones = new ActionRowBuilder().addComponents(
@@ -1400,7 +1412,26 @@ client.on("interactionCreate", async (interaction) => {
           .setStyle(ButtonStyle.Danger)
       );
 
-      await interaction.reply({ embeds: [embed], components: [botones] });
+      try {
+        await canal.send({ embeds: [embed], components: [botones] });
+      } catch (e) {
+        console.error(e);
+        await interaction.reply({
+          embeds: [
+            embedRespuesta(
+              "error",
+              "No pude publicar el panel. Revisa que el bot pueda ver y escribir en ese canal."
+            ),
+          ],
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        embeds: [embedRespuesta("exito", `Panel de registro publicado en <#${CANAL_PANEL_REGISTRO_ID}>.`)],
+        ephemeral: true,
+      });
       return;
     }
 
